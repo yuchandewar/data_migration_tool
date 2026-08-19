@@ -1,0 +1,37 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model Connection {
+  id        String   @id @default(uuid())
+  name      String
+  type      String   // CSV, POSTGRES, MYSQL, MONGODB, API
+  config    String   // JSON stringified configuration
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sourceJobs Job[] @relation("SourceConnection")
+  destJobs   Job[] @relation("DestConnection")
+}
+
+model Job {
+  id                 String   @id @default(uuid())
+  name               String
+  sourceConnectionId String
+  destConnectionId   String
+  sourceDatasetName  String   // Table name, file name, or endpoint
+  destDatasetName    String
+  transformationRules String  // JSON stringified array of rules
+  status             String   @default("PENDING") // PENDING, RUNNING, COMPLETED, FAILED
+  error              String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  sourceConnection Connection @relation("SourceConnection", fields: [sourceConnectionId], references: [id])
+  destConnection   Connection @relation("DestConnection", fields: [destConnectionId], references: [id])
+}
