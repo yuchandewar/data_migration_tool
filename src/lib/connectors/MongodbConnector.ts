@@ -1,6 +1,7 @@
 import { BaseConnector } from './BaseConnector';
 import { DatabaseConnectionConfig, DatasetSchema } from '@/types/migration';
 import { MongoClient } from 'mongodb';
+import * as dns from 'dns';
 
 export class MongodbConnector extends BaseConnector {
   protected config: DatabaseConnectionConfig;
@@ -11,9 +12,39 @@ export class MongodbConnector extends BaseConnector {
     this.config = config as DatabaseConnectionConfig;
   }
 
-  private buildUri(): string {
+  private async buildUri(): Promise<string> {
     if (this.config.connectionUrl) {
-      return this.config.connectionUrl;
+      let uri = this.config.connectionUrl;
+      // Handle the Node.js / MongoDB driver ENOTFOUND SRV bug automatically
+      if (uri.startsWith('mongodb+srv://')) {
+        try {
+          const parsedUrl = new URL(uri);
+          const hostname = parsedUrl.hostname;
+          
+          const srvRecords = await dns.promises.resolveSrv(`_mongodb._tcp.${hostname}`);
+          if (srvRecords.length > 0) {
+            const txtRecords = await dns.promises.resolveTxt(hostname);
+            const txtString = txtRecords.flat().join('');
+            
+            const auth = parsedUrl.username ? `${parsedUrl.username}:${parsedUrl.password}@` : '';
+            const hosts = srvRecords.map(r => `${r.name}:${r.port}`).join(',');
+            let path = parsedUrl.pathname || '/';
+            
+            let newUri = `mongodb://${auth}${hosts}${path}?ssl=true`;
+            if (txtString) newUri += `&${txtString}`;
+            
+            parsedUrl.searchParams.forEach((val, key) => {
+              if (!newUri.includes(key + '=')) newUri += `&${key}=${val}`;
+            });
+            
+            return newUri;
+          }
+        } catch (e) {
+          // If DNS fails, fallback to the original URI and let the driver try
+          console.warn('Auto SRV resolution failed, falling back to original URI', e);
+        }
+      }
+      return uri;
     }
     const auth = this.config.username ? `${this.config.username}:${this.config.password}@` : '';
     return `mongodb://${auth}${this.config.host}:${this.config.port}/${this.config.database}`;
@@ -21,7 +52,8 @@ export class MongodbConnector extends BaseConnector {
 
   async connect(): Promise<void> {
     if (this.client) return;
-    this.client = new MongoClient(this.buildUri());
+    const uri = await this.buildUri();
+    this.client = new MongoClient(uri);
     await this.client.connect();
   }
 
@@ -85,7 +117,24 @@ export class MongodbConnector extends BaseConnector {
     
     const collection = this.client!.db().collection(datasetName);
     if (data.length > 0) {
-      await collection.insertMany(data);
+      // Check if data contains _id to perform an upsert instead of blind insert
+      // This prevents E11000 duplicate key errors if the job is run multiple times
+      if (data[0]._id !== undefined) {
+        const bulkOps = data.map(doc => {
+          // If _id is a string that looks like an ObjectId, we might need to convert it, 
+          // but usually the source driver passes it as an ObjectId already.
+          return {
+            replaceOne: {
+              filter: { _id: doc._id },
+              replacement: doc,
+              upsert: true
+            }
+          };
+        });
+        await collection.bulkWrite(bulkOps);
+      } else {
+        await collection.insertMany(data);
+      }
     }
   }
 }

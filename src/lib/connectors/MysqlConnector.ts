@@ -88,6 +88,46 @@ export class MysqlConnector extends BaseConnector {
 
   async writeData(datasetName: string, data: any[], options?: Record<string, any>): Promise<void> {
     if (!this.connection) await this.connect();
-    // Implementation for bulk insert
+    if (data.length === 0) return;
+
+    const columns = Object.keys(data[0]);
+    if (columns.length === 0) return;
+
+    const values: any[] = [];
+    
+    // Create the placeholders row for one row: (?, ?, ?)
+    const rowPlaceholders = `(${columns.map(() => '?').join(', ')})`;
+    const placeholders = data.map(() => rowPlaceholders).join(', ');
+
+    // Flatten values array
+    for (const row of data) {
+      for (const col of columns) {
+        values.push(row[col] !== undefined ? row[col] : null);
+      }
+    }
+
+    const query = `INSERT INTO \`${datasetName}\` (\`${columns.join('`, `')}\`) VALUES ${placeholders}`;
+
+    try {
+      await this.connection!.execute(query, values);
+    } catch (e: any) {
+      // Auto-create table if it doesn't exist
+      if (e.message && e.message.toLowerCase().includes("doesn't exist")) {
+        console.log(`Table ${datasetName} does not exist, creating...`);
+        const createCols = columns.map(col => {
+          const val = data[0][col];
+          let type = 'TEXT';
+          if (typeof val === 'number') type = 'DOUBLE';
+          if (typeof val === 'boolean') type = 'BOOLEAN';
+          return `\`${col}\` ${type}`;
+        });
+        await this.connection!.execute(`CREATE TABLE \`${datasetName}\` (${createCols.join(', ')});`);
+        // Retry insert
+        await this.connection!.execute(query, values);
+      } else {
+        console.error('Error writing data to MySQL:', e);
+        throw new Error(`Failed to write data: ${e.message}`);
+      }
+    }
   }
 }

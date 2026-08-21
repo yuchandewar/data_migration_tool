@@ -14,15 +14,51 @@ export class PostgresConnector extends BaseConnector {
   async connect(): Promise<void> {
     if (this.client) return;
 
-    this.client = new Client(this.config.connectionUrl ? { connectionString: this.config.connectionUrl } : {
-      host: this.config.host,
-      port: this.config.port,
-      database: this.config.database,
-      user: this.config.username,
-      password: this.config.password,
-    });
+    let sslConfig: any = undefined;
+    
+    // Detect if this is a remote cloud database that requires SSL (Render, Supabase, AWS, etc.)
+    const isCloudDb = 
+      this.config.connectionUrl?.includes('.com') || 
+      this.config.connectionUrl?.includes('.net') || 
+      this.config.connectionUrl?.includes('.io') ||
+      this.config.host?.includes('.com');
 
-    await this.client.connect();
+    // Also check if user explicitly passed sslmode in URL
+    const hasSslInUrl = this.config.connectionUrl?.includes('sslmode=');
+
+    if (isCloudDb || hasSslInUrl) {
+      sslConfig = { rejectUnauthorized: false };
+    }
+
+    if (this.config.connectionUrl) {
+      this.client = new Client({
+        connectionString: this.config.connectionUrl,
+        ssl: sslConfig
+      });
+    } else {
+      this.client = new Client({
+        host: this.config.host,
+        port: this.config.port,
+        database: this.config.database,
+        user: this.config.username,
+        password: this.config.password,
+        ssl: sslConfig
+      });
+    }
+
+    try {
+      await this.client.connect();
+    } catch (e: any) {
+      // If it fails because of SSL on a local/unsupported DB, retry without SSL
+      if (e.message && e.message.includes('The server does not support SSL connections')) {
+        this.client = new Client(this.config.connectionUrl ? { connectionString: this.config.connectionUrl } : {
+          host: this.config.host, port: this.config.port, database: this.config.database, user: this.config.username, password: this.config.password
+        });
+        await this.client.connect();
+      } else {
+        throw e;
+      }
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -90,6 +126,48 @@ export class PostgresConnector extends BaseConnector {
 
   async writeData(datasetName: string, data: any[], options?: Record<string, any>): Promise<void> {
     if (!this.client) await this.connect();
-    // Implementation for bulk insert
+    
+    if (data.length === 0) return;
+
+    const columns = Object.keys(data[0]);
+    if (columns.length === 0) return;
+
+    const values: any[] = [];
+    const placeholders: string[] = [];
+    let paramIndex = 1;
+
+    for (const row of data) {
+      const rowPlaceholders: string[] = [];
+      for (const col of columns) {
+        values.push(row[col] !== undefined ? row[col] : null);
+        rowPlaceholders.push(`$${paramIndex}`);
+        paramIndex++;
+      }
+      placeholders.push(`(${rowPlaceholders.join(', ')})`);
+    }
+
+    const query = `INSERT INTO "${datasetName}" ("${columns.join('", "')}") VALUES ${placeholders.join(', ')}`;
+
+    try {
+      await this.client!.query(query, values);
+    } catch (e: any) {
+      // Auto-create table if it doesn't exist
+      if (e.message && e.message.includes('relation') && e.message.includes('does not exist')) {
+        console.log(`Table ${datasetName} does not exist, creating...`);
+        const createCols = columns.map(col => {
+          const val = data[0][col];
+          let type = 'TEXT';
+          if (typeof val === 'number') type = 'DOUBLE PRECISION';
+          if (typeof val === 'boolean') type = 'BOOLEAN';
+          return `"${col}" ${type}`;
+        });
+        await this.client!.query(`CREATE TABLE "${datasetName}" (${createCols.join(', ')});`);
+        // Retry insert
+        await this.client!.query(query, values);
+      } else {
+        console.error('Error writing data to Postgres:', e);
+        throw new Error(`Failed to write data: ${e.message}`);
+      }
+    }
   }
 }
